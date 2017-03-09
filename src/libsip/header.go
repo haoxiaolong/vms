@@ -3,29 +3,30 @@ package libsip
 import (
 	"github.com/stefankopieczek/gossip/base"
 	"strconv"
+	"fmt"
 )
 
 // Utility methods for creating headers.
 
-func Via(e *SipUA, branch string) *base.ViaHeader {
+func Via(uri *URI, branch string) *base.ViaHeader {
 	return &base.ViaHeader{
 		&base.ViaHop{
 			ProtocolName:    "SIP",
 			ProtocolVersion: "2.0",
-			Transport:       e.Transport,
-			Host:            e.Host,
-			Port:            &e.Port,
+			Transport:       "UDP",
+			Host:            uri.Host,
+			Port:            &uri.Port,
 			Params:          base.NewParams().Add("branch", base.String{S: branch}),
 		},
 	}
 }
 
-func To(e *SipUA, tag string) *base.ToHeader {
+func To(uri *URI, tag string) *base.ToHeader {
 	header := &base.ToHeader{
-		DisplayName: base.String{S: e.DisplayName},
 		Address: &base.SipUri{
-			User:      base.String{S: e.UserName},
-			Host:      e.Host,
+			User:      base.String{S: uri.User},
+			Host:      uri.Host,
+			Port:      &uri.Port,
 			UriParams: base.NewParams(),
 		},
 		Params: base.NewParams(),
@@ -38,13 +39,13 @@ func To(e *SipUA, tag string) *base.ToHeader {
 	return header
 }
 
-func From(e *SipUA, tag string) *base.FromHeader {
+func From(uri *URI, tag string) *base.FromHeader {
 	header := &base.FromHeader{
-		DisplayName: base.String{S: e.DisplayName},
 		Address: &base.SipUri{
-			User:      base.String{S: e.UserName},
-			Host:      e.Host,
-			UriParams: base.NewParams().Add("Transport", base.String{S: e.Transport}),
+			User:      base.String{S: uri.User},
+			Host:      uri.Host,
+			Port:      &uri.Port,
+			UriParams: base.NewParams().Add("Transport", base.String{S: "UDP"}),
 		},
 		Params: base.NewParams(),
 	}
@@ -56,14 +57,19 @@ func From(e *SipUA, tag string) *base.FromHeader {
 	return header
 }
 
-func Contact(e *SipUA) *base.ContactHeader {
-	return &base.ContactHeader{
-		DisplayName: base.String{S: e.DisplayName},
+func Contact(uri *URI, expires *uint32) *base.ContactHeader {
+	header := &base.ContactHeader{
 		Address: &base.SipUri{
-			User: base.String{S: e.UserName},
-			Host: e.Host,
+			User: base.String{S: uri.User},
+			Host: uri.Host,
+			Port: &uri.Port,
 		},
 	}
+	if expires != nil {
+		header.Params.Add("expires", base.String{S: fmt.Sprintf("%v", *expires)})
+	}
+
+	return header
 }
 
 func CSeq(seqno uint32, method base.Method) *base.CSeq {
@@ -87,8 +93,13 @@ func ContentType(ct string) *base.GenericHeader {
 	return &header
 }
 
-func Authorization(a string) *base.GenericHeader {
+func WWWAuthenticate(a string) *base.GenericHeader {
 	header := base.GenericHeader{HeaderName: "WWW-Authenticate", Contents: a}
+	return &header
+}
+
+func Authorization(a string) *base.GenericHeader {
+	header := base.GenericHeader{HeaderName: "Authorization", Contents: a}
 	return &header
 }
 

@@ -34,11 +34,12 @@ type Header struct {
 	Via     *URI
 	Contact *URI
 	CallId  string
-	CSeq    uint32
+	//CSeq    uint32
 
 	ContentType   string
 	ContentLength uint32
 
+	WWWAuthenticate   string
 	Authorization     string
 	Expires           uint32
 	Event             string
