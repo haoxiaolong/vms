@@ -7,9 +7,9 @@ import (
 
 type Method string
 
-func (method *Method) Equals(other *Method) bool {
-	if method != nil && other != nil {
-		return strings.EqualFold(string(*method), string(*other))
+func (method Method) Equals(other Method) bool {
+	if method != "" && other != "" {
+		return strings.EqualFold(string(method), string(other))
 	} else {
 		return method == other
 	}
@@ -45,7 +45,7 @@ type Header struct {
 	Event             string
 	SubscriptionState string
 
-	MaxForwards uint32
+	//MaxForwards uint32
 }
 type URI struct {
 	User string

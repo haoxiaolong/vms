@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"libutil/rand"
 	"time"
-	"go/types"
 )
 
 //UAC收到UAS的处理接口
@@ -37,7 +36,7 @@ type SipUA struct {
 	ResponseHandler ResponseHandler
 
 	tm       *transaction.Manager
-	dialogs  cmap.ConcurrentMap //map[string]*dialog
+	dialogs  cmap.ConcurrentMap //map[callid]*dialog  只有invite和subscribe请求会触发dialog
 	requests cmap.ConcurrentMap //map[requestID]*ServerTransaction 记录客户端的请求所对应的服务端事务，便于响应
 }
 
@@ -77,7 +76,7 @@ func (ua *SipUA) Start() error {
 func (ua *SipUA) Stop() {
 	if ua.tm != nil {
 		ua.tm.Stop()
-		ua.dialogs = nil
+		ua.dialogs = nil //todo clear dialog
 	}
 }
 
@@ -107,7 +106,18 @@ func (uac *SipUA) SendRequest(requestID string, method Method, requestURI *URI, 
 		case r := <-tx.Responses():
 			log.Info("Received response: %v", r.Short())
 
-			if method.Equals(&INVITE) {
+			tag, ok := r.Headers("To")[0].(*base.ToHeader).Params.Get("tag")
+			if ok {
+				switch str := tag.(type) {
+				case base.String:
+					if temp, ok := uac.dialogs.Get(string(r.Headers("Call-Id")[0].(*base.CallId))); ok {
+						dia := temp.(&dialog)
+						dia.to_tag = str.S
+					}
+				}
+			}
+
+			if method.Equals(INVITE) {
 				// Ack 200s manually.
 				log.Info("Sending Ack")
 				tx.Ack()
@@ -118,6 +128,7 @@ func (uac *SipUA) SendRequest(requestID string, method Method, requestURI *URI, 
 			}
 		case e := <-tx.Errors():
 			log.Warn(e.Error())
+			uac.clearDialog(msg.Header.CallId) //invite和subscribe请求不成功
 			return e
 		}
 	}
@@ -159,13 +170,15 @@ func (ua *SipUA) constructResponseHeader(stx *transaction.ServerTransaction, msg
 	tag, _ = stx.Origin().Headers("To")[0].(*base.ToHeader).Params.Get("tag")
 	if tag != nil {
 		toTag = fmt.Sprintf("v", tag)
+	} else {
+		toTag = rand.RandomAlphanumeric(10)
 	}
 	vias := stx.Origin().Headers("Via")
 	headers := []base.SipHeader{
 		From(msg.Header.From, fromTag),
 		To(msg.Header.To, toTag),
 		CallId(msg.Header.CallId),
-		CSeq(msg.Header.CSeq, stx.Origin().Method),
+		CSeq(stx.Origin().Headers("CSeq")[0].(*base.CSeq).SeqNo, stx.Origin().Method),
 	}
 	headers = append(headers, vias...)
 
@@ -173,22 +186,23 @@ func (ua *SipUA) constructResponseHeader(stx *transaction.ServerTransaction, msg
 	//	headers = append(headers, Contact(msg.Header.Contact))
 	//}
 	contactHeader := Contact(msg.Header.Contact, nil)
-	if !stx.Origin().Method.Equals(&base.REGISTER) { //register 特殊处理
+	if string(stx.Origin().Method) != "REGISTER" { //register 在下面特殊处理
 		headers = append(headers, contactHeader)
 	}
-	switch stx.Origin().Method {
-	case REGISTER:
+	switch string(stx.Origin().Method) {
+	case "REGISTER":
 		if len(msg.Header.WWWAuthenticate) > 0 {
 			headers = append(headers, WWWAuthenticate(msg.Header.WWWAuthenticate))
 		} else {
 			//todo 刷新注册频繁如何处理
-			headers = append(headers, Contact(msg.Header.Contact, &(msg.Header.Expires / 3)))
+			ex := msg.Header.Expires / 3
+			headers = append(headers, Contact(msg.Header.Contact, &ex))
 		}
-	case MESSAGE:
+	case "MESSAGE":
 		headers = append(headers, ContentType("application/xml"))
-	case INVITE:
+	case "INVITE":
 		headers = append(headers, ContentType("application/SDP"))
-	case SUBSCRIBE:
+	case "SUBSCRIBE":
 		//todo 订阅响应过期时间
 		headers = append(headers, Expires(msg.Header.Expires))
 	}
@@ -197,12 +211,82 @@ func (ua *SipUA) constructResponseHeader(stx *transaction.ServerTransaction, msg
 	return headers, nil
 }
 func (uac *SipUA) constructRequestHeader(method Method, msg *Message) ([]base.SipHeader, error) {
-	callid := rand.RandomAlphanumeric(10)
-	fromTag := rand.RandomAlphanumeric(10)
-	branch := "z9hG4bK" + rand.RandomAlphabetic(10)
 
-	
-	return nil, nil
+	dia := uac.getDialog(method, msg)
+	//公共部分
+	headers := []base.SipHeader{
+		From(msg.Header.From, dia.from_tag),
+		To(msg.Header.To, dia.to_tag),
+		Via(msg.Header.Via, dia.currentTx.branch),
+		CallId(msg.Header.CallId),
+		CSeq(dia.cseq, base.Method(method)),
+	}
+	if !method.Equals(REGISTER) {
+		headers = append(headers, Contact(msg.Header.Contact, nil))
+	}
+	switch method {
+	case REGISTER:
+		if msg.Header.Expires == 0 { //注销
+			headers = append(headers, Contact(msg.Header.Contact, &msg.Header.Expires))
+		} else {
+			headers = append(headers, Contact(msg.Header.Contact, nil))
+			headers = append(headers, Expires(msg.Header.Expires))
+		}
+		if len(msg.Header.Authorization) > 0 {
+			headers = append(headers, Authorization(msg.Header.Authorization)) //鉴权注册
+		}
+	case MESSAGE:
+		headers = append(headers, ContentType(" application/xml"))
+	case INVITE:
+		headers = append(headers, ContentType("application/SDP"))
+	case SUBSCRIBE:
+		headers = append(headers,
+			Event(msg.Header.Event),
+			Expires(msg.Header.Expires),
+			MaxForwards(70),
+			ContentType("application/xml"))
+	case NOTIFY:
+		headers = append(headers, ContentType(" application/xml"))
+		if msg.Header.Event != "" { //告警订阅通知,资源上报不需要
+			headers = append(headers,
+				Event(msg.Header.Event),
+				SubscriptionState(msg.Header.SubscriptionState))
+		}
+	}
+	headers = append(headers, ContentLength(uint32(len(msg.Body))))
+
+	return headers, nil
+}
+
+func (ua *SipUA) getDialog(method Method, msg *Message) *dialog {
+	dia := &dialog{}
+	if temp, ok := ua.dialogs.Get(msg.Header.CallId); ok {
+		dia = temp.(&dialog)
+		dia.cseq += 1
+	} else {
+		dia.callId = msg.Header.CallId
+		dia.from_tag = rand.RandomAlphanumeric(10)
+		dia.to_tag = ""
+		dia.cseq = 1
+		dia.currentTx = txInfo{}
+		dia.currentTx.branch = "z9hG4bK" + rand.RandomAlphabetic(10)
+		switch method {
+		case INVITE:
+			ua.dialogs.Set(msg.Header.CallId, dia)
+		case SUBSCRIBE:
+			ua.dialogs.Set(msg.Header.CallId, dia)
+			if msg.Header.Expires == 0 {
+				ua.clearDialog(msg.Header.CallId)
+			}
+		case BYE:
+			ua.clearDialog(msg.Header.CallId)
+		}
+	}
+	return dia
+}
+
+func (ua *SipUA) clearDialog(callid string) {
+	ua.dialogs.Pop(callid)
 }
 
 //处理服务端收到的所有请求
@@ -277,9 +361,9 @@ func (ua *SipUA) buildMessage(message base.SipMessage) (m *Message, e error) {
 		msg.Header.ContentType = message.Headers("Content-type")[0].(*base.GenericHeader).Contents
 	}
 
-	if len(message.Headers("MaxForwards")) > 0 {
-		msg.Header.MaxForwards = uint32(*message.Headers("MaxForwards")[0].(*base.MaxForwards))
-	}
+	//if len(message.Headers("MaxForwards")) > 0 {
+	//	msg.Header.MaxForwards = uint32(*message.Headers("MaxForwards")[0].(*base.MaxForwards))
+	//}
 
 	if len(message.Headers("Expires")) > 0 {
 		expires, _ := strconv.Atoi(message.Headers("Expires")[0].(*base.GenericHeader).Contents)
